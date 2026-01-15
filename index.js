@@ -9,6 +9,11 @@ const {
   const MEU_NUMERO = '5521995210939@s.whatsapp.net'
   const GRUPO_AUTORIZADO = '120363422819250668@g.us'
   const PREFIXO ='!'
+//Segurança
+  const DEV_MODE = true // ❗ coloque false em produção
+  let aguardandoConfirmacaoReset = false
+  const FRASE_RESET = 'CONFIRMAR RESET TOTAL'
+
   
   async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info')
@@ -70,10 +75,6 @@ const {
           )
         ) return
       
-        // 🔁 DEDUPLICAÇÃO (AGORA NO LUGAR CERTO)
-        const messageId = msg.key.id
-        if (await jaProcessada(messageId)) return
-        marcarComoProcessada(messageId)
       
         // 👤 identifica o autor corretamente
         const autor = msg.key.fromMe
@@ -90,18 +91,24 @@ const {
       
         // 👇 comandos
         if (command.startsWith('entrada')) {
+          if (!(await finalizarMensagem(msg))) return
+
           const [, valor, ...desc] = command.split(' ')
           salvar('entrada', valor, desc.join(' '))
           return enviar(sock, from, '✅ Entrada registrada')
         }
       
         if (command.startsWith('saida') || command.startsWith('saída')) {
+          if (!(await finalizarMensagem(msg))) return
+
           const [, valor, ...desc] = command.split(' ')
           salvar('saida', valor, desc.join(' '))
           return enviar(sock, from, '❌ Saída registrada')
         }
       
         if (command === 'saldo') {
+          if (!(await finalizarMensagem(msg))) return
+
           const saldo = await calcularSaldo()
           return enviar(
             sock,
@@ -109,21 +116,113 @@ const {
             `💰 Saldo atual: R$ ${saldo.toFixed(2)}`
           )
         }
+
+        if (command === 'saldocompleto') {
+          if (!(await finalizarMensagem(msg))) return
+          
+          const texto = await gerarSaldoCompletoTexto()
+          return enviar(sock, from, texto)
+        }
+        
+        if (command === 'resetbanco') {
+          if (!DEV_MODE) {
+            return enviar(sock, from, '❌ Reset desativado')
+          }
+        
+          if (!(await finalizarMensagem(msg))) return
+        
+          aguardandoConfirmacaoReset = true
+        
+          return enviar(
+            sock,
+            from,
+        `⚠️ ATENÇÃO ⚠️
+        
+        Esse comando APAGA TODO O BANCO.
+        
+        Para confirmar, envie exatamente:
+        ${PREFIXO}confirmar ${FRASE_RESET}
+        `
+          )
+        }
+        
+        if (command === `confirmar ${FRASE_RESET.toLowerCase()}`) {
+          if (!DEV_MODE || !aguardandoConfirmacaoReset) return
+        
+          if (!(await finalizarMensagem(msg))) return
+        
+          aguardandoConfirmacaoReset = false
+          await limparBanco()
+        
+          return enviar(
+            sock,
+            from,
+        '🧹 Banco de dados limpo com sucesso'
+          )
+        }
+        
       
-        // fallback
+  // fallback
         enviar(
           sock,
           from,
-      `❓ Comandos:
-      ${PREFIXO}entrada valor descrição
-      ${PREFIXO}saida valor descrição
-      ${PREFIXO}saldo`
-        )
-      })
-      
+              `❓ Comandos:
+              ${PREFIXO}entrada valor descrição
+              ${PREFIXO}saida valor descrição
+              ${PREFIXO}saldo`
+              )
+        })
+    
       
         
   }
+
+  async function finalizarMensagem(msg) {
+    const messageId = msg.key.id
+    if (await jaProcessada(messageId)) return false
+    marcarComoProcessada(messageId)
+    return true
+  }
+
+  
+  async function gerarSaldoCompletoTexto() {
+    const rows = await buscarMovimentacoes()
+  
+    let texto = '📊 *SALDO COMPLETO*\n\n'
+    let saldo = 0
+    let totalEntradas = 0
+    let totalSaidas = 0
+  
+    for (const r of rows) {
+      const data = new Date(r.data + 'Z')
+      .toLocaleString('pt-BR', {
+        rimeZone: 'America/Sao_paulo'
+      })
+  
+      if (r.tipo === 'entrada') {
+        saldo += r.valor
+        totalEntradas += r.valor
+        texto += `🟢 *Entrada*\n`
+      } else {
+        saldo -= r.valor
+        totalSaidas += r.valor
+        texto += `🔴 *Saída*\n`
+      }
+  
+      texto += `💵 Valor: R$ ${r.valor.toFixed(2)}\n`
+      texto += `📝 Desc: ${r.descricao || '-'}\n`
+      texto += `📅 Data: ${data}\n\n`
+    }
+  
+    texto += `━━━━━━━━━━━━━━━\n`
+    texto += `💰 *TOTAL ENTRADAS: R$ ${totalEntradas.toFixed(2)}*\n`
+    texto += `💰 *TOTAL SAÍDAS: R$ ${totalSaidas.toFixed(2)}*\n`
+    texto += `💰 *SALDO FINAL: R$ ${saldo.toFixed(2)}*`
+
+  
+    return texto
+  }
+  
   
   function salvar(tipo, valor, descricao) {
     db.run(
@@ -163,6 +262,31 @@ const {
       [id]
     )
   }
+
+  function buscarMovimentacoes() {
+    return new Promise((resolve, reject) => {
+      db.all(
+        `SELECT tipo, valor, descricao, data
+         FROM movimentacoes
+         ORDER BY data ASC`,
+        (err, rows) => {
+          if (err) reject(err)
+          else resolve(rows)
+        }
+      )
+    })
+  }
+
+  function limparBanco() {
+    return new Promise((resolve, reject) => {
+      db.serialize(() => {
+        db.run('DELETE FROM movimentacoes')
+        db.run('DELETE FROM mensagens_processadas')
+        resolve()
+      })
+    })
+  }
+  
   
   
   startBot()

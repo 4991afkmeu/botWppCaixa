@@ -26,6 +26,16 @@ db.serialize(() => {
       PRIMARY KEY (id, grupo)
     )
   `)
+// Usuários Autorizados
+  db.run(`
+  CREATE TABLE IF NOT EXISTS usuarios_autorizados (
+    lid TEXT,
+    grupo TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (lid, grupo)
+  )
+`)
+
 
 })
 

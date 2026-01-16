@@ -14,5 +14,13 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": ""
+  "description": "",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/4991afkmeu/botWppCaixa.git"
+  },
+  "bugs": {
+    "url": "https://github.com/4991afkmeu/botWppCaixa/issues"
+  },
+  "homepage": "https://github.com/4991afkmeu/botWppCaixa#readme"
 }

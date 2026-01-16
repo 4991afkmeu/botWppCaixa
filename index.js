@@ -1,3 +1,11 @@
+process.on('unhandledRejection', err => {
+  console.error('🔥 PROMISE NÃO TRATADA:', err)
+})
+
+process.on('uncaughtException', err => {
+  console.error('🔥 EXCEÇÃO NÃO CAPTURADA:', err)
+})
+
 import makeWASocket, {
   useMultiFileAuthState
 } from '@whiskeysockets/baileys'
@@ -40,11 +48,12 @@ async function startBot() {
   })
 
   // 📩 MENSAGENS
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0]
+sock.ev.on('messages.upsert', async ({ messages }) => {
+  try {
+    const msg = messages?.[0]
     if (!msg?.message) return
 
-    const from = msg.key.remoteJid
+    const from = String(msg.key?.remoteJid || '')
     if (!from.endsWith('@g.us')) return
     if (!GRUPOS_AUTORIZADOS.includes(from)) return
 
@@ -67,7 +76,6 @@ async function startBot() {
       msg.key.fromMe ? MEU_LID : msg.key.participant
     )
 
-
     console.log('Autor detectado:', autor)
 
     // 🛡️ ADMIN SEMPRE PASSA
@@ -85,71 +93,65 @@ async function startBot() {
       .toLowerCase()
       .trim()
 
-    // ============ COMANDOS ============
-
+    // ============ ENTRADA ============
     if (command.startsWith('entrada')) {
       const [, valor, ...desc] = command.split(' ')
+
+      if (!valor || desc.length === 0) {
+        return enviar(
+          sock,
+          from,
+          '❌ Uso correto: !entrada 5,50 descrição'
+        )
+      }
+
       const valorNum = parseValor(valor)
+      if (valorNum === null) {
+        return enviar(
+          sock,
+          from,
+          '❌ Valor inválido. Ex: 5,50 ou 5.50'
+        )
+      }
 
-    if (valorNum === null) {
-      return enviar(sock, from, '❌ Valor inválido. Ex: 5,50 ou 5.50')
+      salvar('entrada', valorNum, desc.join(' '), grupo)
+      return enviar(sock, from, '✅ Entrada registrada')
     }
 
-    salvar('entrada', valorNum, desc.join(' '), grupo)
-    return enviar(sock, from, '✅ Entrada registrada')
-
-    }
-
+    // ============ SAÍDA ============
     if (command.startsWith('saida') || command.startsWith('saída')) {
       const [, valor, ...desc] = command.split(' ')
+
+      if (!valor || desc.length === 0) {
+        return enviar(
+          sock,
+          from,
+          '❌ Uso correto: !saida 5,50 descrição'
+        )
+      }
+
       const valorNum = parseValor(valor)
+      if (valorNum === null) {
+        return enviar(
+          sock,
+          from,
+          '❌ Valor inválido. Ex: 5,50 ou 5.50'
+        )
+      }
 
-    if (valorNum === null) {
-      return enviar(sock, from, '❌ Valor inválido. Ex: 5,50 ou 5.50')
-    }
-
-    salvar('entrada', valorNum, desc.join(' '), grupo)
-    return enviar(sock, from, '✅ Saída registrada')
+      // ✅ CORREÇÃO CRÍTICA AQUI
+      salvar('saida', valorNum, desc.join(' '), grupo)
+      return enviar(sock, from, '❌ Saída registrada')
     }
 
     if (command === 'saldo') {
       const saldo = await calcularSaldo(grupo)
-      return enviar(sock, from, `💰 Saldo atual: ${saldo}`)
+      return enviar(sock, from, `💰 Saldo atual: ${formatarMoeda(saldo)}`)
     }
 
     if (command === 'saldocompleto') {
       const texto = await gerarSaldoCompletoTexto(grupo)
       return enviar(sock, from, texto)
-    }
-
-    // 🔥 RESET
-    if (command === 'resetbanco') {
-      if (!DEV_MODE || !USUARIOS_ADMIN.includes(autor)) {
-        return enviar(sock, from, '❌ Apenas administradores')
-      }
-
-      aguardandoConfirmacaoReset = true
-
-      return enviar(
-        sock,
-        from,
-`⚠️ ATENÇÃO ⚠️
-
-Este comando APAGA TODO O BANCO DESTE GRUPO.
-
-Para confirmar:
-${PREFIXO}confirmar ${FRASE_RESET}`
-      )
-    }
-
-    if (command === `confirmar ${FRASE_RESET.toLowerCase()}`) {
-      if (!DEV_MODE || !aguardandoConfirmacaoReset) return
-      if (!USUARIOS_ADMIN.includes(autor)) return
-
-      aguardandoConfirmacaoReset = false
-      await limparBanco(grupo)
-
-      return enviar(sock, from, '🧹 Banco limpo com sucesso')
     }
 
     // ❓ fallback
@@ -162,7 +164,26 @@ ${PREFIXO}saida valor descrição
 ${PREFIXO}saldo
 ${PREFIXO}saldocompleto`
     )
-  })
+  } catch (err) {
+    console.error('❌ ERRO NO BOT:', err)
+
+    // resposta segura sem quebrar
+    try {
+      const msg = messages?.[0]
+      const from = msg?.key?.remoteJid
+      if (from) {
+        await sock.sendMessage(from, {
+          text: '⚠️ Ocorreu um erro ao processar o comando. Tente novamente.'
+        })
+      }
+    } catch {}
+
+    return
+  }
+})
+
+
+  
 
   // 👥 AUTORIZAÇÃO AUTOMÁTICA AO ENTRAR NO GRUPO
   sock.ev.on('group-participants.update', async ({ id, participants, action }) => {

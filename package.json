@@ -3,5 +3,16 @@
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "qrcode-terminal": "^0.12.0",
     "sqlite3": "^5.1.7"
-  }
+  },
+  "name": "botwppcaixa",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": ""
 }

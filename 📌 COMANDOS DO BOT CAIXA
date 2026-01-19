@@ -1,0 +1,50 @@
+📌 COMANDOS DO BOT CAIXA
+────────────────────────
+
+🔹 REGISTRO DE MOVIMENTAÇÕES
+!entrada <valor> <descrição>
+Ex: !entrada 5,50 venda de bala
+
+!saida <valor> <descrição>
+Ex: !saida 10,00 compra de gelo
+
+
+🔹 CONSULTAS
+!saldo
+→ Mostra o saldo atual do grupo
+
+!saldocompleto
+→ Mostra todas as entradas e saídas com detalhes
+
+
+🔐 COMANDOS DE ADMINISTRADOR
+(apenas usuários administradores)
+
+!ultimos
+!ultimos <quantidade>
+→ Lista os últimos lançamentos com ID
+Ex: !ultimos 5
+
+
+!deletar <id>
+→ Remove um lançamento específico
+Ex: !deletar 23
+
+
+!editar <id> <novo_valor> <nova_descrição>
+→ Edita valor e descrição de um lançamento
+Ex: !editar 23 7,50 venda corrigida
+
+
+🛡️ SEGURANÇA
+• Apenas admins podem editar ou deletar
+• Todas as ações usam ID do lançamento
+• Valores aceitam vírgula ou ponto (5,50 ou 5.50)
+• O bot ignora mensagens duplicadas
+• Usuários são autorizados automaticamente ao entrar no grupo
+
+
+ℹ️ OBSERVAÇÕES
+• Os comandos funcionam apenas nos grupos autorizados
+• O prefixo padrão é "!"
+• Em caso de erro, o bot retorna mensagem e continua funcionando

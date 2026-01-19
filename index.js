@@ -72,11 +72,15 @@ sock.ev.on('messages.upsert', async ({ messages }) => {
     ) return
 
     // 👤 autor (LID)
-    const autor = normalizarAutor(
-      msg.key.fromMe ? MEU_LID : msg.key.participant
-    )
+    const autor = obterAutorSeguro(msg)
 
-    console.log('Autor detectado:', autor)
+    if (!autor) {
+      console.warn('⚠️ Autor indefinido, abortando comando')
+      return
+    }
+    
+    console.log('👤 Autor confirmado:', autor)
+    
 
     // 🛡️ ADMIN SEMPRE PASSA
     if (USUARIOS_ADMIN.includes(autor)) {
@@ -93,6 +97,97 @@ sock.ev.on('messages.upsert', async ({ messages }) => {
       .toLowerCase()
       .trim()
 
+    
+      if (command.startsWith('ultimos')) {
+        if (!USUARIOS_ADMIN.includes(autor)) {
+          return enviar(sock, from, '❌ Apenas admins podem usar este comando')
+        }
+      
+        const qtd = Math.min(
+          parseInt(command.split(' ')[1]) || 5,
+          20
+        )
+      
+        const registros = await buscarUltimasMovimentacoes(grupo, qtd)
+      
+        if (!registros.length) {
+          return enviar(sock, from, '⚠️ Nenhum lançamento encontrado')
+        }
+      
+        let texto = '📋 *Últimos lançamentos:*\n\n'
+      
+        registros.forEach(r => {
+          texto += `#${r.id} ${r.tipo === 'entrada' ? '🟢' : '🔴'} ${formatarMoeda(r.valor)}\n`
+          texto += `${r.descricao || '-'}\n`
+          texto += `👤 ${r.autor}\n\n`
+        })
+      
+        return enviar(sock, from, texto)
+      }
+
+      if (command.startsWith('deletar')) {
+        if (!USUARIOS_ADMIN.includes(autor)) {
+          return enviar(sock, from, '❌ Apenas admins podem deletar lançamentos')
+        }
+      
+        const id = parseInt(command.split(' ')[1])
+        if (!id) {
+          return enviar(sock, from, '❌ Uso correto:\n!deletar <id>')
+        }
+      
+        const registro = await buscarMovimentacaoPorId(id, grupo)
+        if (!registro) {
+          return enviar(sock, from, '⚠️ Lançamento não encontrado')
+        }
+      
+        await deletarMovimentacao(id)
+      
+        return enviar(
+          sock,
+          from,
+          `🗑️ Lançamento #${id} removido:\n${registro.descricao || '-'}`
+        )
+      }
+      
+      if (command.startsWith('editar')) {
+        if (!USUARIOS_ADMIN.includes(autor)) {
+          return enviar(sock, from, '❌ Apenas admins podem editar lançamentos')
+        }
+      
+        const partes = command.split(' ')
+        const id = parseInt(partes[1])
+        const valor = partes[2]
+        const descricao = partes.slice(3).join(' ')
+      
+        if (!id || !valor || !descricao) {
+          return enviar(
+            sock,
+            from,
+            '❌ Uso correto:\n!editar <id> <valor> <nova descrição>'
+          )
+        }
+      
+        const valorNum = parseValor(valor)
+        if (valorNum === null) {
+          return enviar(sock, from, '❌ Valor inválido')
+        }
+      
+        const registro = await buscarMovimentacaoPorId(id, grupo)
+        if (!registro) {
+          return enviar(sock, from, '⚠️ Lançamento não encontrado')
+        }
+      
+        await atualizarMovimentacao(id, valorNum, descricao)
+      
+        return enviar(
+          sock,
+          from,
+          `✏️ Lançamento #${id} atualizado com sucesso`
+        )
+      }
+      
+
+      
     // ============ ENTRADA ============
     if (command.startsWith('entrada')) {
       const [, valor, ...desc] = command.split(' ')
@@ -113,7 +208,15 @@ sock.ev.on('messages.upsert', async ({ messages }) => {
           '❌ Valor inválido. Ex: 5,50 ou 5.50'
         )
       }
-
+      console.log({
+        tipo: 'entrada',
+        valor: valorNum,
+        descricao: desc.join(' '),
+        grupo,
+        autor,
+        messageId: msg.key.id
+      })
+      
       salvar('entrada', valorNum, desc.join(' '), grupo)
       return enviar(sock, from, '✅ Entrada registrada')
     }
@@ -183,8 +286,6 @@ ${PREFIXO}saldocompleto`
 })
 
 
-  
-
   // 👥 AUTORIZAÇÃO AUTOMÁTICA AO ENTRAR NO GRUPO
   sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
     if (!GRUPOS_AUTORIZADOS.includes(id)) return
@@ -198,7 +299,6 @@ ${PREFIXO}saldocompleto`
     }
   })
 }
-
 // ================= FUNÇÕES =================
 
 async function finalizarMensagem(msg, grupo) {
@@ -208,12 +308,16 @@ async function finalizarMensagem(msg, grupo) {
   return true
 }
 
-function salvar(tipo, valor, descricao, grupo) {
+function salvar(tipo, valor, descricao, grupo, autor, messageId) {
   db.run(
-    'INSERT INTO movimentacoes (grupo, tipo, valor, descricao) VALUES (?, ?, ?, ?)',
-    [grupo, tipo, valor, descricao]
+    `INSERT INTO movimentacoes
+     (grupo, tipo, valor, descricao, autor, mensagem_id)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [grupo, tipo, valor, descricao, autor, messageId]
   )
 }
+
+
 
 
 function calcularSaldo(grupo) {
@@ -261,6 +365,59 @@ function buscarMovimentacoes(grupo) {
     )
   })
 }
+function buscarUltimasMovimentacoes(grupo, limite = 5) {
+  return new Promise((resolve) => {
+    // Se grupo não vier (blindagem extra)
+    if (!grupo) return resolve([])
+
+    const sql = `
+      SELECT id, tipo, valor, descricao, autor
+      FROM movimentacoes
+      WHERE grupo = ?
+      ORDER BY id DESC
+      LIMIT ?
+    `
+
+    db.all(sql, [grupo, limite], (err, rows) => {
+      if (err) {
+        console.error('❌ Erro ao buscar últimos lançamentos:', err.message)
+        return resolve([]) // NÃO quebra o bot
+      }
+
+      resolve(rows || [])
+    })
+  })
+}
+
+function buscarMovimentacaoPorId (id, grupo) {
+  return new Promise(resolve => {
+    db.get(
+      'SELECT * FROM movimentacoes WHERE id = ? AND grupo = ?',
+      [id, grupo],
+      (_, row) => resolve(row)
+    )
+  })
+}
+function deletarMovimentacao (id) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      'DELETE FROM movimentacoes WHERE id = ?',
+      [id],
+      err => err ? reject(err) : resolve()
+    )
+  })
+}
+function atualizarMovimentacao (id, valor, descricao) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      `UPDATE movimentacoes
+       SET valor = ?, descricao = ?
+       WHERE id = ?`,
+      [valor, descricao, id],
+      err => err ? reject(err) : resolve()
+    )
+  })
+}
 
 function jaProcessada(id, grupo) {
   return new Promise(resolve => {
@@ -292,6 +449,25 @@ function limparBanco(grupo) {
 function enviar(sock, to, text) {
   return sock.sendMessage(to, { text })
 }
+function obterAutorSeguro(msg) {
+  if (!msg || !msg.key) return null
+
+  if (msg.key.fromMe) {
+    return MEU_LID
+  }
+
+  if (msg.key.participant) {
+    return normalizarAutor(msg.key.participant)
+  }
+
+  // fallback: tenta usar remoteJid
+  if (msg.key.remoteJid) {
+    return normalizarAutor(msg.key.remoteJid)
+  }
+
+  return null
+}
+
 
 function autorizarUsuario(lid, grupo) {
   db.run(

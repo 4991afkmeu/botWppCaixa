@@ -1,536 +1,244 @@
-process.on('unhandledRejection', err => {
-  console.error('🔥 PROMISE NÃO TRATADA:', err)
-})
+process.env.TZ = 'America/Sao_Paulo';
 
-process.on('uncaughtException', err => {
-  console.error('🔥 EXCEÇÃO NÃO CAPTURADA:', err)
-})
+import makeWASocket, { 
+    useMultiFileAuthState, 
+    fetchLatestBaileysVersion,
+    jidNormalizedUser 
+} from '@whiskeysockets/baileys';
 
-import makeWASocket, {
-  useMultiFileAuthState
-} from '@whiskeysockets/baileys'
+import pino from 'pino';
+import { Boom } from '@hapi/boom';
+import qrcode from 'qrcode-terminal';
+import * as DB from './db.js';
 
-import qrcode from 'qrcode-terminal'
-import db from './db.js'
+// CONFIGURAÇÃO DE SEGURANÇA
+const MEU_LID = '5521995210939@s.whatsapp.net'; 
+const PREFIX = '!';
 
-// ================= CONFIG =================
-const MEU_LID = '149770056265729@lid'
+const logger = pino({ level: 'info' });
+DB.initDb();
 
-const USUARIOS_ADMIN = [
-  MEU_LID
-]
+// Tratamento de Erros
+process.on('unhandledRejection', (reason) => logger.error({ err: reason }, 'Rejeição não tratada'));
+process.on('uncaughtException', (err) => {
+    logger.error({ err }, 'Exceção não capturada');
+    process.exit(1);
+});
 
-const GRUPOS_AUTORIZADOS = [
-  '120363422819250668@g.us',
-  '120363422795378941@g.us',
-  '120363423088236492@g.us'
-]
+const toCents = (txt) => {
+    const val = parseFloat(txt.replace(',', '.'));
+    return isNaN(val) ? null : Math.round(val * 100);
+};
 
-const PREFIXO = '!'
+const toBRL = (cents) => (cents / 100).toLocaleString('pt-br', { style: 'currency', currency: 'BRL' });
 
-// 🔐 Segurança
-const DEV_MODE = true
-let aguardandoConfirmacaoReset = false
-const FRASE_RESET = 'CONFIRMAR RESET TOTAL'
-// ==========================================
+async function start() {
+    const { state, saveCreds } = await useMultiFileAuthState('session_data');
+    const { version } = await fetchLatestBaileysVersion();
 
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info')
-  const sock = makeWASocket({ auth: state })
+    const sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: true,
+        logger: pino({ level: 'silent' })
+    });
 
-  sock.ev.on('creds.update', saveCreds)
+    sock.ev.on('creds.update', saveCreds);
 
-  // 🔑 Conexão
-  sock.ev.on('connection.update', ({ connection, qr }) => {
-    if (qr) qrcode.generate(qr, { small: true })
-    if (connection === 'open') console.log('✅ WhatsApp conectado')
-    if (connection === 'close') startBot()
-  })
-
-  // 📩 MENSAGENS
-sock.ev.on('messages.upsert', async ({ messages }) => {
-  try {
-    const msg = messages?.[0]
-    if (!msg?.message) return
-
-    const from = String(msg.key?.remoteJid || '')
-    if (!from.endsWith('@g.us')) return
-    if (!GRUPOS_AUTORIZADOS.includes(from)) return
-
-    const grupo = from
-
-    const text =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text
-
-    if (!text || !text.startsWith(PREFIXO)) return
-
-    // 🔁 ignora respostas do bot
-    if (
-      msg.key.fromMe &&
-      (text.includes('✅') || text.includes('❌') || text.includes('💰'))
-    ) return
-
-    // 👤 autor (LID)
-    const autor = obterAutorSeguro(msg)
-
-    if (!autor) {
-      console.warn('⚠️ Autor indefinido, abortando comando')
-      return
-    }
-    
-    console.log('👤 Autor confirmado:', autor)
-    
-
-    // 🛡️ ADMIN SEMPRE PASSA
-    if (USUARIOS_ADMIN.includes(autor)) {
-      autorizarUsuario(autor, grupo)
-    } else {
-      if (!(await usuarioAutorizado(autor, grupo))) return
-    }
-
-    // 🔁 evita duplicidade
-    if (!(await finalizarMensagem(msg, grupo))) return
-
-    const command = text
-      .slice(PREFIXO.length)
-      .toLowerCase()
-      .trim()
-
-    
-      if (command.startsWith('ultimos')) {
-        if (!USUARIOS_ADMIN.includes(autor)) {
-          return enviar(sock, from, '❌ Apenas admins podem usar este comando')
+    sock.ev.on('connection.update', (u) => {
+        if (u.qr) qrcode.generate(u.qr, { small: true });
+        if (u.connection === 'close') {
+            const code = (u.lastDisconnect.error instanceof Boom)?.output?.statusCode;
+            if (code !== 401) start();
+        } else if (u.connection === 'open') {
+            console.log('🚀 Sistema Financeiro Online e Seguro');
         }
-      
-        const qtd = Math.min(
-          parseInt(command.split(' ')[1]) || 5,
-          20
-        )
-      
-        const registros = await buscarUltimasMovimentacoes(grupo, qtd)
-      
-        if (!registros.length) {
-          return enviar(sock, from, '⚠️ Nenhum lançamento encontrado')
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify') return;
+        const m = messages[0];
+        if (!m.message) return;
+
+        // 1. EXTRAÇÃO ROBUSTA DE TEXTO (Precisa vir antes de tudo)
+        const text = (
+            m.message.conversation || 
+            m.message.extendedTextMessage?.text || 
+            m.message.imageMessage?.caption || 
+            m.message.videoMessage?.caption || 
+            ""
+        ).trim();
+
+        const jid = m.key.remoteJid;
+        const isMe = m.key.fromMe;
+
+        // 2. FILTROS INICIAIS (Status, Canais e Anti-Loop)
+        if (jid === 'status@broadcast' || jid.endsWith('@newsletter')) return;
+        
+        // Blindagem: Se for eu, só continua se for um comando. 
+        // Se for outra pessoa e não tiver prefixo, ignora também.
+        if (!text.startsWith(PREFIX)) return;
+        if (isMe && !text.startsWith(PREFIX)) return; 
+
+        // 3. IDENTIFICAÇÃO DO USUÁRIO
+        const sender = jidNormalizedUser(m.key.participant || jid);
+
+        console.log('--- PROCESSANDO COMANDO ---');
+        console.log(`DE: ${isMe ? 'MEU NÚMERO' : sender}`);
+        console.log(`TEXTO: ${text}`);
+
+        // 4. MESSAGE GUARD (Anti-duplicação)
+        // Ignora o guard se for você mesmo testando, para facilitar
+        if (!isMe && !DB.MessageGuard.isNew(m.key.id)) {
+            console.log(`IGNORADO: Mensagem repetida`);
+            return;
         }
-      
-        let texto = '📋 *Últimos lançamentos:*\n\n'
-      
-        registros.forEach(r => {
-          texto += `#${r.id} ${r.tipo === 'entrada' ? '🟢' : '🔴'} ${formatarMoeda(r.valor)}\n`
-          texto += `${r.descricao || '-'}\n`
-          texto += `👤 ${r.autor}\n\n`
-        })
-      
-        return enviar(sock, from, texto)
-      }
 
-      if (command.startsWith('deletar')) {
-        if (!USUARIOS_ADMIN.includes(autor)) {
-          return enviar(sock, from, '❌ Apenas admins podem deletar lançamentos')
+        // 5. DEFINIÇÃO DE COMANDO E CARGOS
+        const args = text.slice(PREFIX.length).trim().split(/ +/);
+        const cmd = args.shift().toLowerCase();
+        
+        // Se for "fromMe", forçamos a role 'owner' para evitar erro de dígito 9
+        const role = isMe ? 'owner' : DB.UserRepo.getRole(sender, MEU_LID);
+        const isAuthorized = DB.GroupRepo.isAuthorized(jid);
+
+        console.log(`ROLE: ${role} | AUTORIZADO: ${isAuthorized}`);
+
+        try {
+            // HIERARQUIA 1: ADM PRINCIPAL (Owner)
+            if (role === 'owner') {
+                if (cmd === 'addgrupo') { 
+                    DB.GroupRepo.add(jid); 
+                    return sock.sendMessage(jid, { text: '✅ Grupo autorizado para registros financeiros.' }); 
+                }
+                if (cmd === 'removegrupo') { 
+                    DB.GroupRepo.remove(jid); 
+                    return sock.sendMessage(jid, { text: '🚫 Grupo removido da lista autorizada.' }); 
+                }
+                
+                const target = m.message.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+                if (cmd === 'addadmin' && target) {
+                    DB.UserRepo.setRole(target, 'admin', sender);
+                    return sock.sendMessage(jid, { text: `👑 @${target.split('@')[0]} promovido a ADMIN.`, mentions: [target] });
+                }
+                if (cmd === 'removeadmin' && target) {
+                    DB.UserRepo.remove(target);
+                    return sock.sendMessage(jid, { text: '✅ Admin removido.' });
+                }
+            }
+
+            // Bloqueio de segurança: Se o grupo não for autorizado, o bot não responde comandos abaixo
+            if (!isAuthorized && role !== 'owner') return;
+
+            // HIERARQUIA 2: ADMIN
+            if (['owner', 'admin'].includes(role)) {
+                const target = m.message.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+                if (cmd === 'addmod' && target) {
+                    DB.UserRepo.setRole(target, 'mod', sender);
+                    return sock.sendMessage(jid, { text: `🛡️ @${target.split('@')[0]} promovido a MODERADOR.`, mentions: [target] });
+                }
+                
+                // Auditoria e Deleção
+                if (cmd === 'delultimo') {
+                    DB.FinanceRepo.deleteN(jid, 1, sender);
+                    return sock.sendMessage(jid, { text: '🗑️ Último registro removido com sucesso.' });
+                }
+                if (cmd === 'delid') {
+                    const id = parseInt(args[0]);
+                    const ok = DB.FinanceRepo.deleteById(id, sender);
+                    return sock.sendMessage(jid, { text: ok ? `✅ Registro ID ${id} removido.` : '❌ ID não encontrado.' });
+                }
+            }
+
+            // HIERARQUIA 3: QUALQUER CARGO (Mod, Admin, Owner)
+            if (role) {
+                if (cmd === 'entrada' || cmd === 'saida') {
+                    const val = toCents(args[0]);
+                    const d = args.slice(1).join(' ');
+                    if (!val || !d) return sock.sendMessage(jid, { text: '❌ Use: !entrada 10,00 Descrição' });
+                    
+                    DB.FinanceRepo.add(jid, sender, cmd === 'entrada' ? 'IN' : 'OUT', val, d);
+                    return sock.sendMessage(jid, { text: `✅ *${cmd.toUpperCase()} REGISTRADA*\n💰 Valor: ${toBRL(val)}\n📝 Desc: ${d}` });
+                }
+                if (cmd === 'saldo') {
+                    const s = DB.FinanceRepo.getBalance(jid);
+                    return sock.sendMessage(jid, { text: `📊 *FECHAMENTO ATUAL*\n\n💰 Saldo em Caixa: *${toBRL(s)}*` });
+                }
+
+                // --- COMANDO !AJUDA ---
+                if (cmd === 'ajuda' || cmd === 'menu') {
+                    const menu = `📖 *MENU DE COMANDOS* 📖\n\n` +
+                        `*OPERACIONAIS:*\n` +
+                        `!entrada [valor] [desc]\n` +
+                        `!saida [valor] [desc]\n` +
+                        `!saldo (Resumo do caixa)\n` +
+                        `!rel (Relatório detalhado)\n` +
+                        `!filtro [texto] (Busca registros)\n\n` +
+                        `*GESTÃO:*\n` +
+                        `!delultimo (Apaga o anterior)\n` +
+                        `!delid [ID] (Apaga por ID)`;
+                    return sock.sendMessage(jid, { text: menu });
+                }
+
+                // --- COMANDO !REL ---
+                if (cmd === 'rel') {
+                    const s = DB.FinanceRepo.getBalance(jid);
+                    const report = DB.FinanceRepo.getFullReport(jid);
+                    if (report.length === 0) return sock.sendMessage(jid, { text: '📭 Nenhuma transação encontrada.' });
+
+                    let msg = `📋 *RELATÓRIO FINANCEIRO*\n\n`;
+                    report.forEach(r => {
+                        const userNum = r.user_jid.split('@')[0];
+                        const emoji = r.type === 'IN' ? '🔹' : '🔸';
+                        msg += `${emoji} *ID: ${r.id}* | ${toBRL(r.amount_cents)}\n`;
+                        msg += `📝 ${r.description}\n`;
+                        msg += `👤 Por: @${userNum}\n`;
+                        const dataBr = new Date(r.timestamp + ' UTC').toLocaleString('pt-BR', {
+                            timeZone: 'America/Sao_Paulo',
+                            day: '2-digit',
+                            month: '2-digit',
+                            year: 'numeric',
+                            hour: '2-digit',
+                            minute: '2-digit'
+                        });
+                        msg += `📅 ${dataBr}\n`;
+                        msg += `──────────────────────────\n`;
+                    });
+                        msg += `📊 *FECHAMENTO ATUAL*\n\n💰 Saldo em Caixa: *${toBRL(s)}*`;
+
+                    return sock.sendMessage(jid, { 
+                        text: msg, 
+                        mentions: report.map(r => r.user_jid),
+
+                    });
+                    
+                }
+
+                // --- COMANDO !FILTRO ---
+                if (cmd === 'filtro') {
+                    const busca = args.join(' ');
+                    if (!busca) return sock.sendMessage(jid, { text: '❌ Use: !filtro [descrição]' });
+
+                    const results = DB.FinanceRepo.filterByDesc(jid, busca);
+                    if (results.length === 0) return sock.sendMessage(jid, { text: '🔍 Nenhum resultado para: ' + busca });
+
+                    let msg = `🔍 *RESULTADOS PARA:* "${busca}"\n\n`;
+                    results.forEach(r => {
+                        const emoji = r.type === 'IN' ? '🔹' : '🔸';
+                        msg += `${emoji} *ID: ${r.id}* - ${toBRL(r.amount_cents)}\n`;
+                        msg += `📝 ${r.description}\n`;
+                        msg += `📅 ${new Date(r.timestamp).toLocaleDateString('pt-BR')}\n\n`;
+                    });
+
+                    return sock.sendMessage(jid, { text: msg });
+                }
+            }
+
+        } catch (e) {
+            logger.error(e);
+            return sock.sendMessage(jid, { text: '❌ Ocorreu um erro ao processar o comando.' });
         }
-      
-        const id = parseInt(command.split(' ')[1])
-        if (!id) {
-          return enviar(sock, from, '❌ Uso correto:\n!deletar <id>')
-        }
-      
-        const registro = await buscarMovimentacaoPorId(id, grupo)
-        if (!registro) {
-          return enviar(sock, from, '⚠️ Lançamento não encontrado')
-        }
-      
-        await deletarMovimentacao(id)
-      
-        return enviar(
-          sock,
-          from,
-          `🗑️ Lançamento #${id} removido:\n${registro.descricao || '-'}`
-        )
-      }
-      
-      if (command.startsWith('editar')) {
-        if (!USUARIOS_ADMIN.includes(autor)) {
-          return enviar(sock, from, '❌ Apenas admins podem editar lançamentos')
-        }
-      
-        const partes = command.split(' ')
-        const id = parseInt(partes[1])
-        const valor = partes[2]
-        const descricao = partes.slice(3).join(' ')
-      
-        if (!id || !valor || !descricao) {
-          return enviar(
-            sock,
-            from,
-            '❌ Uso correto:\n!editar <id> <valor> <nova descrição>'
-          )
-        }
-      
-        const valorNum = parseValor(valor)
-        if (valorNum === null) {
-          return enviar(sock, from, '❌ Valor inválido')
-        }
-      
-        const registro = await buscarMovimentacaoPorId(id, grupo)
-        if (!registro) {
-          return enviar(sock, from, '⚠️ Lançamento não encontrado')
-        }
-      
-        await atualizarMovimentacao(id, valorNum, descricao)
-      
-        return enviar(
-          sock,
-          from,
-          `✏️ Lançamento #${id} atualizado com sucesso`
-        )
-      }
-      
-
-      
-    // ============ ENTRADA ============
-    if (command.startsWith('entrada')) {
-      const [, valor, ...desc] = command.split(' ')
-
-      if (!valor || desc.length === 0) {
-        return enviar(
-          sock,
-          from,
-          '❌ Uso correto: !entrada 5,50 descrição'
-        )
-      }
-
-      const valorNum = parseValor(valor)
-      if (valorNum === null) {
-        return enviar(
-          sock,
-          from,
-          '❌ Valor inválido. Ex: 5,50 ou 5.50'
-        )
-      }
-      console.log({
-        tipo: 'entrada',
-        valor: valorNum,
-        descricao: desc.join(' '),
-        grupo,
-        autor,
-        messageId: msg.key.id
-      })
-      
-      salvar('entrada', valorNum, desc.join(' '), grupo)
-      return enviar(sock, from, '✅ Entrada registrada')
-    }
-
-    // ============ SAÍDA ============
-    if (command.startsWith('saida') || command.startsWith('saída')) {
-      const [, valor, ...desc] = command.split(' ')
-
-      if (!valor || desc.length === 0) {
-        return enviar(
-          sock,
-          from,
-          '❌ Uso correto: !saida 5,50 descrição'
-        )
-      }
-
-      const valorNum = parseValor(valor)
-      if (valorNum === null) {
-        return enviar(
-          sock,
-          from,
-          '❌ Valor inválido. Ex: 5,50 ou 5.50'
-        )
-      }
-
-      // ✅ CORREÇÃO CRÍTICA AQUI
-      salvar('saida', valorNum, desc.join(' '), grupo)
-      return enviar(sock, from, '❌ Saída registrada')
-    }
-
-    if (command === 'saldo') {
-      const saldo = await calcularSaldo(grupo)
-      return enviar(sock, from, `💰 Saldo atual: ${formatarMoeda(saldo)}`)
-    }
-
-    if (command === 'saldocompleto') {
-      const texto = await gerarSaldoCompletoTexto(grupo)
-      return enviar(sock, from, texto)
-    }
-
-    // ❓ fallback
-    return enviar(
-      sock,
-      from,
-`❓ Comandos:
-${PREFIXO}entrada valor descrição
-${PREFIXO}saida valor descrição
-${PREFIXO}saldo
-${PREFIXO}saldocompleto`
-    )
-  } catch (err) {
-    console.error('❌ ERRO NO BOT:', err)
-
-    // resposta segura sem quebrar
-    try {
-      const msg = messages?.[0]
-      const from = msg?.key?.remoteJid
-      if (from) {
-        await sock.sendMessage(from, {
-          text: '⚠️ Ocorreu um erro ao processar o comando. Tente novamente.'
-        })
-      }
-    } catch {}
-
-    return
-  }
-})
-
-
-  // 👥 AUTORIZAÇÃO AUTOMÁTICA AO ENTRAR NO GRUPO
-  sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
-    if (!GRUPOS_AUTORIZADOS.includes(id)) return
-
-    if (action !== 'add') return
-
-    for (const lid of participants) {
-      const lidNormalizado = normalizarAutor(lid)
-      autorizarUsuario(lidNormalizado, id)
-      console.log('✅ Usuário autorizado automaticamente:', lid)
-    }
-  })
-}
-// ================= FUNÇÕES =================
-
-async function finalizarMensagem(msg, grupo) {
-  const id = msg.key.id
-  if (await jaProcessada(id, grupo)) return false
-  marcarComoProcessada(id, grupo)
-  return true
+    });
 }
 
-function salvar(tipo, valor, descricao, grupo, autor, messageId) {
-  db.run(
-    `INSERT INTO movimentacoes
-     (grupo, tipo, valor, descricao, autor, mensagem_id)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [grupo, tipo, valor, descricao, autor, messageId]
-  )
-}
-
-
-
-
-function calcularSaldo(grupo) {
-  return new Promise(resolve => {
-    db.all(
-      'SELECT tipo, valor FROM movimentacoes WHERE grupo = ?',
-      [grupo],
-      (_, rows) => {
-        let saldo = 0
-        rows.forEach(r => saldo += r.tipo === 'entrada' ? r.valor : -r.valor)
-        resolve(formatarMoeda(saldo))
-      }
-    )
-  })
-}
-
-async function gerarSaldoCompletoTexto(grupo) {
-  const rows = await buscarMovimentacoes(grupo)
-
-  let texto = '📊 *SALDO COMPLETO*\n\n'
-  let saldo = 0
-
-  for (const r of rows) {
-    const data = new Date(r.data + 'Z').toLocaleString('pt-BR', {
-      timeZone: 'America/Sao_Paulo'
-    })
-
-    saldo += r.tipo === 'entrada' ? r.valor : -r.valor
-    texto += `${r.tipo === 'entrada' ? '🟢 Entrada' : '🔴 Saída'}\n`
-    texto += `💵 ${formatarMoeda(r.valor)}\n`
-    texto += `📝 ${r.descricao || '-'}\n`
-    texto += `📅 ${data}\n\n`
-  }
-
-  texto += `━━━━━━━━━━━━━━━\n💰 *SALDO FINAL: R$ ${formatarMoeda(saldo)}*`
-  return texto
-}
-
-function buscarMovimentacoes(grupo) {
-  return new Promise(resolve => {
-    db.all(
-      'SELECT tipo, valor, descricao, data FROM movimentacoes WHERE grupo = ? ORDER BY data ASC',
-      [grupo],
-      (_, rows) => resolve(rows)
-    )
-  })
-}
-function buscarUltimasMovimentacoes(grupo, limite = 5) {
-  return new Promise((resolve) => {
-    // Se grupo não vier (blindagem extra)
-    if (!grupo) return resolve([])
-
-    const sql = `
-      SELECT id, tipo, valor, descricao, autor
-      FROM movimentacoes
-      WHERE grupo = ?
-      ORDER BY id DESC
-      LIMIT ?
-    `
-
-    db.all(sql, [grupo, limite], (err, rows) => {
-      if (err) {
-        console.error('❌ Erro ao buscar últimos lançamentos:', err.message)
-        return resolve([]) // NÃO quebra o bot
-      }
-
-      resolve(rows || [])
-    })
-  })
-}
-
-function buscarMovimentacaoPorId (id, grupo) {
-  return new Promise(resolve => {
-    db.get(
-      'SELECT * FROM movimentacoes WHERE id = ? AND grupo = ?',
-      [id, grupo],
-      (_, row) => resolve(row)
-    )
-  })
-}
-function deletarMovimentacao (id) {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'DELETE FROM movimentacoes WHERE id = ?',
-      [id],
-      err => err ? reject(err) : resolve()
-    )
-  })
-}
-function atualizarMovimentacao (id, valor, descricao) {
-  return new Promise((resolve, reject) => {
-    db.run(
-      `UPDATE movimentacoes
-       SET valor = ?, descricao = ?
-       WHERE id = ?`,
-      [valor, descricao, id],
-      err => err ? reject(err) : resolve()
-    )
-  })
-}
-
-function jaProcessada(id, grupo) {
-  return new Promise(resolve => {
-    db.get(
-      'SELECT 1 FROM mensagens_processadas WHERE id = ? AND grupo = ?',
-      [id, grupo],
-      (_, row) => resolve(!!row)
-    )
-  })
-}
-
-function marcarComoProcessada(id, grupo) {
-  db.run(
-    'INSERT OR IGNORE INTO mensagens_processadas (id, grupo) VALUES (?, ?)',
-    [id, grupo]
-  )
-}
-
-function limparBanco(grupo) {
-  return new Promise(resolve => {
-    db.serialize(() => {
-      db.run('DELETE FROM movimentacoes WHERE grupo = ?', [grupo])
-      db.run('DELETE FROM mensagens_processadas WHERE grupo = ?', [grupo])
-      resolve()
-    })
-  })
-}
-
-function enviar(sock, to, text) {
-  return sock.sendMessage(to, { text })
-}
-function obterAutorSeguro(msg) {
-  if (!msg || !msg.key) return null
-
-  if (msg.key.fromMe) {
-    return MEU_LID
-  }
-
-  if (msg.key.participant) {
-    return normalizarAutor(msg.key.participant)
-  }
-
-  // fallback: tenta usar remoteJid
-  if (msg.key.remoteJid) {
-    return normalizarAutor(msg.key.remoteJid)
-  }
-
-  return null
-}
-
-
-function autorizarUsuario(lid, grupo) {
-  db.run(
-    'INSERT OR IGNORE INTO usuarios_autorizados (lid, grupo) VALUES (?, ?)',
-    [lid, grupo]
-  )
-}
-
-function usuarioAutorizado(lid, grupo) {
-  return new Promise(resolve => {
-    db.get(
-      'SELECT 1 FROM usuarios_autorizados WHERE lid = ? AND grupo = ?',
-      [lid, grupo],
-      (_, row) => resolve(!!row)
-    )
-  })
-}
-
-function normalizarAutor(id) {
-  if (!id) return null
-
-  // Se vier objeto (Baileys às vezes manda assim)
-  if (typeof id === 'object') {
-    if (id.id) id = id.id
-    else return null
-  }
-
-  // Garante string
-  id = String(id)
-
-  // Já é LID
-  if (id.endsWith('@lid')) return id
-
-  // Número normal
-  if (id.endsWith('@s.whatsapp.net')) {
-    return id.split('@')[0] + '@lid'
-  }
-
-  return id
-}
-
-function parseValor(valorStr) {
-  if (!valorStr) return null
-
-  // remove R$, espaços e pontos de milhar
-  let v = valorStr
-    .replace(/\s/g, '')
-    .replace('R$', '')
-    .replace(/\./g, '')   // remove separador de milhar
-    .replace(',', '.')    // troca vírgula por ponto
-
-  const numero = Number(v)
-
-  return isNaN(numero) ? null : numero
-}
-
-function formatarMoeda(v) {
-  return v.toLocaleString('pt-BR', {
-    style: 'currency',
-    currency: 'BRL'
-  })
-}
-
-
-
-startBot()
+start();

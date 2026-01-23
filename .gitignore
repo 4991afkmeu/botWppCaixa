@@ -1,4 +1,17 @@
-node_modules/
+# Pastas de Autenticação (Segurança)
+auth/
 auth_info/
-*.db
-.env
+session_data/
+
+# Dependências
+node_modules/
+
+# Banco de Dados (Dados Locais)
+bot.db
+financeiro.db
+financeiro.db-shm
+financeiro.db-wal
+
+# Logs e Sistema
+*.log
+.DS_Store
